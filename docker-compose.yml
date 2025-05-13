@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  web_app:
+    build:
+      context: ./Backend - comparação direta  # Caminho para o diretório que contém o Dockerfile
+      dockerfile: Dockerfile
+    container_name: paf_analyzer_app
+    ports:
+      - "5001:5001"  # Mapeia porta 5001 do seu computador para a porta 5001 do container
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=production # Ou development. Para produção, desativa o modo debug do Flask.
+      - FLASK_DEBUG=0        # Explicitamente desativa o debug para produção
+      - PORT=8080          # A porta que o app.py dentro do container vai usar
+    # Opcional: Se você quiser que os dados persistam entre reinícios do container (não relevante para app.processed_tasks em memória)
+    # volumes:
+    #   - ./algum_volume_no_host:/app/dados_persistentes

@@ -1,35 +1,20 @@
-from flask import Flask, request, jsonify, send_file, send_from_directory
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import re
 import unidecode
-from io import BytesIO, StringIO
+# Levenshtein não é mais usado na lógica principal
+# import Levenshtein 
+from io import BytesIO
 import os
 import logging
-import uuid
-import redis
+import uuid 
 
-app = Flask(__name__) # static_folder será definido depois, condicionalmente
+app = Flask(__name__)
+CORS(app) 
 
-# Configuração do CORS para desenvolvimento local (permitir requisições do frontend React)
-# Em produção, se o Flask servir o frontend, o CORS pode não ser estritamente necessário
-# para as rotas de API, mas não prejudica.
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-
-
-# Configuração do Redis
-redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
-redis_client = None
-try:
-    redis_client = redis.StrictRedis.from_url(redis_url, decode_responses=False)
-    redis_client.ping()
-    logging.info(f"Conectado ao Redis em: {redis_url.split('@')[-1] if '@' in redis_url else redis_url}")
-except redis.exceptions.ConnectionError as e:
-    logging.error(f"Não foi possível conectar ao Redis: {e}. A aplicação pode não funcionar corretamente sem Redis.")
-    # A aplicação continuará, mas os endpoints que dependem do Redis verificarão 'redis_client is None'
-
-REDIS_TASK_TTL = int(os.environ.get('REDIS_TASK_TTL', 3600)) 
+app.processed_tasks = {}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
@@ -78,6 +63,7 @@ def normalize_address_val(value: any) -> str:
 
 def get_col_mappings_from_df(df_columns: list) -> dict:
     mappings = {}
+    # Garante que todos os nomes de coluna sejam tratados como string antes de .lower()
     df_cols_lower_stripped = {str(col).lower().replace(" ", ""): str(col) for col in df_columns}
     
     for standard_key, variations in POSSIBLE_COLUMN_MAPPINGS.items():
@@ -186,53 +172,40 @@ def core_processing_logic_and_prepare_output(df: pd.DataFrame) -> dict:
     else:
         app.logger.info("Nenhum grupo encontrado, df_grouped_ordered permanecerá vazio.")
     
-    task_id = f"task:{uuid.uuid4().hex}" 
-    cols_to_store_in_redis = [col for col in df_all_data_with_colors.columns if col not in ['enderecoNormalizado', 'original_index_col']]
+    task_id = uuid.uuid4().hex
+    cols_to_store = [col for col in df_all_data_with_colors.columns if col not in ['enderecoNormalizado', 'original_index_col']]
     
-    df_to_store_redis = pd.DataFrame(columns=cols_to_store_in_redis) 
+    df_to_store_in_memory = pd.DataFrame(columns=cols_to_store) 
     if not df_grouped_ordered.empty:
-        df_to_store_redis = df_grouped_ordered[cols_to_store_in_redis].copy()
+        df_to_store_in_memory = df_grouped_ordered[cols_to_store].copy()
     
-    if redis_client:
-        try:
-            csv_buffer = StringIO()
-            df_to_store_redis.to_csv(csv_buffer, index=False)
-            csv_string = csv_buffer.getvalue()
-            
-            redis_client.setex(task_id, REDIS_TASK_TTL, csv_string)
-            app.logger.info(f"Resultados para task_id {task_id} armazenados no Redis com TTL de {REDIS_TASK_TTL}s. Total de itens: {len(df_to_store_redis)}.")
-        except Exception as e:
-            app.logger.error(f"Erro ao armazenar task_id {task_id} no Redis: {e}")
-    else:
-        app.logger.warning("Redis client não está disponível. Não foi possível armazenar os resultados da tarefa.")
+    app.processed_tasks[task_id] = df_to_store_in_memory
+    
+    app.logger.info(f"Resultados para task_id {task_id} armazenados. Total de itens agrupados: {len(app.processed_tasks[task_id])}.")
 
     preview_data_list = []
-    if not df_to_store_redis.empty:
+    if not app.processed_tasks[task_id].empty:
         app.logger.info("Criando preview_data_list...")
-        preview_data_list = df_to_store_redis.head(PREVIEW_DATA_ROWS).to_dict(orient='records')
+        preview_data_list = app.processed_tasks[task_id].head(PREVIEW_DATA_ROWS).to_dict(orient='records')
         app.logger.info(f"preview_data_list criada com {len(preview_data_list)} registros.")
     
     group_colors_present = []
-    if not df_to_store_redis.empty and 'groupColor' in df_to_store_redis.columns:
-        group_colors_present = list(df_to_store_redis['groupColor'].dropna().unique())
+    if not app.processed_tasks[task_id].empty and 'groupColor' in app.processed_tasks[task_id].columns:
+        group_colors_present = list(app.processed_tasks[task_id]['groupColor'].dropna().unique())
     
     app.logger.info("Preparando resposta JSON final...")
     final_response = {
         "task_id": task_id,
         "preview_data": preview_data_list,
-        "total_grouped_items": len(df_to_store_redis),
+        "total_grouped_items": len(app.processed_tasks[task_id]),
         "total_groups": len(groups_indices_list),
         "group_colors_present": group_colors_present
     }
     app.logger.info("Resposta JSON final preparada. Enviando para o cliente...")
     return final_response
 
-# --- Rotas de API ---
 @app.route('/api/analyze', methods=['POST'])
 def analyze_file_endpoint():
-    if not redis_client: 
-        return jsonify({"message": "Serviço temporariamente indisponível devido a problema com o armazenamento de resultados. Tente novamente mais tarde."}), 503
-
     app.logger.info("Requisição /api/analyze recebida.")
     if 'file' not in request.files:
         return jsonify({"message": "Nenhum arquivo enviado"}), 400
@@ -283,32 +256,17 @@ def analyze_file_endpoint():
 
 @app.route('/api/download_processed/<task_id>', methods=['GET'])
 def download_processed_endpoint(task_id):
-    if not redis_client:
-        return jsonify({"message": "Serviço temporariamente indisponível devido a problema com o armazenamento de resultados."}), 503
-
     app.logger.info(f"Requisição /api/download_processed/{task_id} recebida.")
     
-    try:
-        csv_string_from_redis_bytes = redis_client.get(task_id)
-    except Exception as e:
-        app.logger.error(f"Erro ao tentar ler do Redis para task_id {task_id}: {e}")
-        return jsonify({"message": "Erro ao acessar os resultados processados. Tente novamente."}), 500
-
-    if csv_string_from_redis_bytes is None:
-        app.logger.warning(f"Task_id {task_id} não encontrado no Redis (ou expirou).")
+    df_to_download_original = app.processed_tasks.get(task_id)
+    
+    if df_to_download_original is None:
+        app.logger.warning(f"Task_id {task_id} não encontrado em processed_tasks.")
         return jsonify({"message": "Resultados não encontrados ou expirados. Por favor, processe o arquivo novamente."}), 404
 
-    try:
-        try:
-            csv_string = csv_string_from_redis_bytes.decode('utf-8')
-            df_to_download = pd.read_csv(StringIO(csv_string), dtype=str, keep_default_na=False)
-        except UnicodeDecodeError:
-            app.logger.warning(f"UnicodeDecodeError ao decodificar CSV do Redis para task_id {task_id} com UTF-8. Tentando com ISO-8859-1.")
-            csv_string = csv_string_from_redis_bytes.decode('iso-8859-1', errors='replace')
-            df_to_download = pd.read_csv(StringIO(csv_string), dtype=str, keep_default_na=False)
-        
-        df_to_download.replace({'': None}, inplace=True)
+    df_to_download = df_to_download_original.copy() 
 
+    try:
         final_output_df = pd.DataFrame(columns=OUTPUT_FIELD_ORDER) 
         
         if not df_to_download.empty:
@@ -323,7 +281,7 @@ def download_processed_endpoint(task_id):
                     if actual_col_name_in_df and actual_col_name_in_df in row_from_stored_df and pd.notna(row_from_stored_df[actual_col_name_in_df]):
                         new_row_for_excel[standard_field_name] = row_from_stored_df[actual_col_name_in_df]
                     elif standard_field_name in row_from_stored_df and pd.notna(row_from_stored_df[standard_field_name]):
-                         new_row_for_excel[standard_field_name] = row_from_stored_df[standard_field_name]
+                        new_row_for_excel[standard_field_name] = row_from_stored_df[standard_field_name]
                     else:
                         new_row_for_excel[standard_field_name] = '' 
                 output_data_rows.append(new_row_for_excel)
@@ -331,7 +289,7 @@ def download_processed_endpoint(task_id):
             if output_data_rows:
                 final_output_df = pd.DataFrame(output_data_rows, columns=OUTPUT_FIELD_ORDER)
             
-        app.logger.info(f"Gerando arquivo Excel para task_id {task_id} com {len(final_output_df)} linhas a partir de dados do Redis.")
+        app.logger.info(f"Gerando arquivo Excel para task_id {task_id} com {len(final_output_df)} linhas.")
         output_stream = BytesIO()
         with pd.ExcelWriter(output_stream, engine='xlsxwriter') as writer:
             final_output_df.to_excel(writer, index=False, sheet_name='Análise de Endereços Agrupados')
@@ -339,6 +297,10 @@ def download_processed_endpoint(task_id):
         
         filename = f'analise-fraude-agrupada-{pd.Timestamp.now().strftime("%Y-%m-%d_%H%M%S")}.xlsx'
         
+        if task_id in app.processed_tasks:
+            del app.processed_tasks[task_id]
+            app.logger.info(f"Task_id {task_id} removido da memória.")
+
         return send_file(
             output_stream,
             mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
@@ -347,44 +309,22 @@ def download_processed_endpoint(task_id):
         )
 
     except Exception as e:
-        app.logger.error(f"Erro ao gerar arquivo para download para task_id {task_id} a partir do Redis: {str(e)}", exc_info=True)
+        app.logger.error(f"Erro ao gerar arquivo para download para task_id {task_id}: {str(e)}", exc_info=True)
         return jsonify({"message": f"Erro interno ao gerar arquivo para download: {str(e)}"}), 500
 
-# --- Servir o Frontend Estático (APENAS se não estiver usando Nginx ou similar na frente) ---
-# Esta parte é para quando o Flask também serve os arquivos do React
-# O caminho para 'frontend_build' deve ser relativo à localização de app.py
-# Exemplo: se app.py está em 'backend-flask/' e o build do react está em 'backend-flask/frontend_build/'
-STATIC_FOLDER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'frontend_build')
-
-# Verifica se a pasta de build do frontend existe. Se não, não tenta servir.
-# Isso é útil para desenvolvimento local do backend sem o build do frontend.
-if os.path.exists(STATIC_FOLDER_PATH):
-    app.static_folder = STATIC_FOLDER_PATH
-    app.static_url_path = ''
-    app.logger.info(f"Servindo arquivos estáticos de: {app.static_folder}")
-
-    @app.route('/', defaults={'path': ''})
-    @app.route('/<path:path>')
-    def serve_react_app(path):
-        # Se o caminho solicitado existir na pasta estática, sirva-o
-        full_path = os.path.join(app.static_folder, path)
-        if path != "" and os.path.exists(full_path):
-            # Evitar Directory Traversal
-            if not os.path.abspath(full_path).startswith(os.path.abspath(app.static_folder)):
-                return "Caminho inválido", 400
-            return send_from_directory(app.static_folder, path)
-        # Caso contrário, sirva o index.html principal (para o roteamento do React)
-        else:
-            return send_from_directory(app.static_folder, 'index.html')
-else:
-    app.logger.warning(f"Pasta de build do frontend não encontrada em: {STATIC_FOLDER_PATH}. O frontend não será servido pelo Flask.")
-    # Rota raiz de fallback se o frontend não for servido
-    @app.route('/')
-    def index_fallback():
-        return "API Backend está rodando. Pasta do frontend não encontrada para servir a UI."
-
-
 if __name__ == '__main__':
+    port = int(os.environ.get("PORT", 5001))
+    # Debug mode é True por padrão para dev local, mas False se FLASK_DEBUG=0 ou FLASK_ENV=production
+    debug_mode_str = os.environ.get("FLASK_DEBUG", "1") # Default to "1" (True)
+    flask_env = os.environ.get("FLASK_ENV", "development")
+
+    if flask_env == "production":
+        debug_mode = False
+    else:
+        debug_mode = debug_mode_str == "1"
+            
+    app.logger.info(f"Iniciando servidor Flask na porta {port} com debug={debug_mode} (FLASK_ENV={flask_env}).")
+    app.run(host='0.0.0.0', port=port, debug=debug_mode)
     port = int(os.environ.get("PORT", 5001)) 
-    app.logger.info(f"Iniciando servidor Flask na porta {port} (para desenvolvimento local).")
+    app.logger.info(f"Iniciando servidor Flask na porta {port}.")
     app.run(host='0.0.0.0', port=port, debug=True)

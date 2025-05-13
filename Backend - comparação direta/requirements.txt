@@ -7,5 +7,3 @@ unidecode
 python-Levenshtein
 numpy
 xlsxwriter
-gunicorn
-redis
