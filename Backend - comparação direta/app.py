@@ -1,22 +1,43 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, send_from_directory
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import re
 import unidecode
-# Levenshtein não é mais usado na lógica principal
-# import Levenshtein 
 from io import BytesIO
 import os
 import logging
 import uuid 
+import sys # Adicionado para sys._MEIPASS e sys.frozen
 
-app = Flask(__name__)
-CORS(app) 
+# --- Configuração Inicial do Flask e Caminhos Estáticos ---
+# Determinar o caminho base para arquivos estáticos
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    # Aplicação está rodando como um executável PyInstaller
+    # Não é o caso primário para Docker, mas incluído por completude se o código for reutilizado
+    BASE_DIR_FOR_STATIC = sys._MEIPASS
+else:
+    # Aplicação está rodando como um script Python normal (o caso dentro do Docker)
+    BASE_DIR_FOR_STATIC = os.path.dirname(os.path.abspath(__file__)) # __file__ será /app/app.py no container
+
+STATIC_FOLDER_PATH = os.path.join(BASE_DIR_FOR_STATIC, 'frontend_build') # Espera /app/frontend_build
+
+# Instanciar Flask. static_url_path='' faz com que arquivos em static_folder sejam servidos da raiz.
+app = Flask(__name__, static_folder=STATIC_FOLDER_PATH, static_url_path='')
+CORS(app, resources={r"/api/*": {"origins": "*"}}) # Aplica CORS apenas às rotas de API
 
 app.processed_tasks = {}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+
+# Log para verificar se a pasta estática e o index.html são encontrados
+if not os.path.exists(STATIC_FOLDER_PATH):
+    app.logger.warning(f"ALERTA INICIAL: Pasta estática '{STATIC_FOLDER_PATH}' NÃO EXISTE no momento da instanciação do Flask.")
+elif not os.path.exists(os.path.join(STATIC_FOLDER_PATH, 'index.html')):
+    app.logger.warning(f"ALERTA INICIAL: 'index.html' NÃO encontrado dentro de '{STATIC_FOLDER_PATH}'.")
+else:
+    app.logger.info(f"SUCESSO INICIAL: Flask instanciado. Pasta estática '{STATIC_FOLDER_PATH}' e 'index.html' parecem existir.")
+
 
 GROUP_COLORS = [
     'group-color-1', 'group-color-2', 'group-color-3', 
@@ -63,7 +84,6 @@ def normalize_address_val(value: any) -> str:
 
 def get_col_mappings_from_df(df_columns: list) -> dict:
     mappings = {}
-    # Garante que todos os nomes de coluna sejam tratados como string antes de .lower()
     df_cols_lower_stripped = {str(col).lower().replace(" ", ""): str(col) for col in df_columns}
     
     for standard_key, variations in POSSIBLE_COLUMN_MAPPINGS.items():
@@ -118,7 +138,7 @@ def core_processing_logic_and_prepare_output(df: pd.DataFrame) -> dict:
     if num_rows_valid == 0:
         app.logger.info("Nenhum endereço válido encontrado após normalização.")
         return {
-            "task_id": uuid.uuid4().hex, "preview_data": [], "total_grouped_items": 0,
+            "task_id": str(uuid.uuid4()), "preview_data": [], "total_grouped_items": 0,
             "total_groups": 0, "group_colors_present": []
         }
 
@@ -172,7 +192,7 @@ def core_processing_logic_and_prepare_output(df: pd.DataFrame) -> dict:
     else:
         app.logger.info("Nenhum grupo encontrado, df_grouped_ordered permanecerá vazio.")
     
-    task_id = uuid.uuid4().hex
+    task_id = str(uuid.uuid4())
     cols_to_store = [col for col in df_all_data_with_colors.columns if col not in ['enderecoNormalizado', 'original_index_col']]
     
     df_to_store_in_memory = pd.DataFrame(columns=cols_to_store) 
@@ -204,6 +224,7 @@ def core_processing_logic_and_prepare_output(df: pd.DataFrame) -> dict:
     app.logger.info("Resposta JSON final preparada. Enviando para o cliente...")
     return final_response
 
+# --- Rotas de API ---
 @app.route('/api/analyze', methods=['POST'])
 def analyze_file_endpoint():
     app.logger.info("Requisição /api/analyze recebida.")
@@ -312,19 +333,46 @@ def download_processed_endpoint(task_id):
         app.logger.error(f"Erro ao gerar arquivo para download para task_id {task_id}: {str(e)}", exc_info=True)
         return jsonify({"message": f"Erro interno ao gerar arquivo para download: {str(e)}"}), 500
 
+# --- Servir o Frontend Estático (Catch-all route) ---
+# Esta rota deve ser UMA DAS ÚLTIMAS definidas, especialmente depois das rotas de API.
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react_app(path):
+    # app.static_folder foi definido na instanciação do Flask
+    if app.static_folder and os.path.exists(app.static_folder):
+        # Se um caminho específico é solicitado e existe (ex: /assets/main.js ou /favicon.ico)
+        path_to_check = os.path.join(app.static_folder, path)
+        if path != "" and os.path.exists(path_to_check):
+            # Medida de segurança simples contra directory traversal
+            if not os.path.abspath(path_to_check).startswith(os.path.abspath(app.static_folder)):
+                app.logger.warning(f"Tentativa de acesso inválido (directory traversal): {path}")
+                return "Caminho inválido", 400
+            app.logger.info(f"Servindo arquivo estático específico: {path}")
+            return send_from_directory(app.static_folder, path)
+        else:
+            # Para a rota raiz ou qualquer outra rota não API que não corresponda a um arquivo, servir index.html
+            index_html_path = os.path.join(app.static_folder, 'index.html')
+            if os.path.exists(index_html_path):
+                app.logger.info(f"Servindo index.html para o path: '{path}'")
+                return send_from_directory(app.static_folder, 'index.html')
+            else:
+                app.logger.error(f"ERRO CRÍTICO: index.html não encontrado em {app.static_folder} ao tentar servir para path: '{path}'")
+                return "Arquivo index.html principal não encontrado.", 404
+    else:
+        # Fallback se a pasta estática não estiver configurada ou não existir
+        app.logger.warning(f"Tentativa de servir frontend, mas static_folder não está configurado ou não existe: '{app.static_folder}'")
+        return "Interface do usuário não está disponível (static_folder não encontrado).", 404
+
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5001))
-    # Debug mode é True por padrão para dev local, mas False se FLASK_DEBUG=0 ou FLASK_ENV=production
-    debug_mode_str = os.environ.get("FLASK_DEBUG", "1") # Default to "1" (True)
-    flask_env = os.environ.get("FLASK_ENV", "development")
+    debug_mode_str = os.environ.get("FLASK_DEBUG", "0") # Padrão para 0 (False) para Docker/produção
+    flask_env = os.environ.get("FLASK_ENV", "production") # Padrão para production
 
     if flask_env == "production":
         debug_mode = False
-    else:
+    else: # development ou outro
         debug_mode = debug_mode_str == "1"
-            
+           
     app.logger.info(f"Iniciando servidor Flask na porta {port} com debug={debug_mode} (FLASK_ENV={flask_env}).")
     app.run(host='0.0.0.0', port=port, debug=debug_mode)
-    port = int(os.environ.get("PORT", 5001)) 
-    app.logger.info(f"Iniciando servidor Flask na porta {port}.")
-    app.run(host='0.0.0.0', port=port, debug=True)

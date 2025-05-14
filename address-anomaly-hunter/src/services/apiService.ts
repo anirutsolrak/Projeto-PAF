@@ -13,7 +13,7 @@ interface ProcessResult {
   group_colors_present: string[];
 }
 
-const API_BASE_URL = 'http://localhost:5001';
+const API_BASE_URL = '';
 // Aumentando para ~20 minutos para processamento (1080000 ms = 18 min)
 // e ~22 minutos para a requisição de análise (18 min + 2 min upload = 1200000 ms)
 const BASE_PROCESSING_TIMEOUT = 1080000; 
