@@ -1,13 +1,9 @@
 services:
   web_app:
-    build:
-      context: ./Backend - comparação direta
-      dockerfile: Dockerfile
+    build: .
     container_name: paf_analyzer_app
     ports:
       - "5001:5001"
     environment:
-      - FLASK_APP=app.py
-      - FLASK_ENV=production 
-      - FLASK_DEBUG=0        
+      - FLASK_ENV=production
       - PORT=5001
