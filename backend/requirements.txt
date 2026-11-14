@@ -1,0 +1,8 @@
+Flask
+Flask-CORS
+pandas
+numpy
+openpyxl
+xlrd
+unidecode
+xlsxwriter
